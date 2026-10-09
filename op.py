@@ -15,7 +15,7 @@ from mlflow.pyfunc import PyFuncModel, PythonModel
 from operator_lib.util import Config, MLOperator, Selector
 from operator_lib.util.helpers import TrainMlflowLogger
 
-from training import train_model, forecast_value, slot_of
+from training import train_model, forecast_value, slot_of, LAGS
 
 
 HOUR = datetime.timedelta(hours=1)
@@ -74,12 +74,14 @@ class Operator(MLOperator):
 
     def _forecast(self, target: datetime.datetime) -> float:
         profile = float(self._params["profile"][slot_of(target)])
-        lag168 = self._hourly(target - 168 * HOUR)
-        lag48 = self._hourly(target - 48 * HOUR)
+        lags = self._params.get("lags", LAGS)
+        features: typing.Dict[str, typing.Optional[float]] = {
+            name: self._hourly(target - hours * HOUR) for name, hours in lags.items()
+        }
         level = [self._hourly(target - k * HOUR) for k in range(25, 49)]
         level = [v for v in level if v is not None]
-        level24 = sum(level) / len(level) if len(level) >= 12 else None
-        return forecast_value(self._params["coef"], lag168, lag48, level24, profile)
+        features["level24"] = sum(level) / len(level) if len(level) >= 12 else None
+        return forecast_value(self._params["coef"], features, profile)
 
     def _prune(self, now_bucket: datetime.datetime) -> None:
         horizon = now_bucket - 200 * HOUR

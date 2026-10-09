@@ -4,17 +4,18 @@ Day-ahead forecast of the hourly mean of net grid power (W).
 
 The forecast for target hour T is made during hour H = T - 24h, and it uses only
 hours that are complete by then (<= H - 1), so training and inference see the
-same information:
+same information and the horizon is a true 24 h:
 
   lag168   hourly mean at T - 168h (same hour last week)
   lag48    hourly mean at T - 48h  (same hour of day, two days earlier)
+  lag25    hourly mean at T - 25h  (last complete hour at forecast time)
   level24  mean of the 24 complete hours T-48h .. T-25h (recent level)
   profile  mean by local hour of day, weekday vs weekend
 
 A missing lag falls back to the profile. The coefficients are ordinary least
 squares. Before the final fit, the last VALIDATION_DAYS of the window are held out
-and the model is compared with three naive baselines; those numbers are logged on
-the run so a change can be judged against them.
+and the model is compared with naive baselines; those numbers are logged on the
+run so a change can be judged against them.
 
 op.py imports the helpers below so that both sides build features identically.
 """
@@ -41,7 +42,10 @@ LOCAL_TZ = "Europe/Berlin"
 # than this is treated as missing rather than as a mean of a few readings.
 MIN_SAMPLES_PER_HOUR = 30
 HISTORY_HOURS = 8 * 24
-FEATURES = ("lag168", "lag48", "level24", "profile")
+# Lags in hours before the target; every one is >= HORIZON_H + 1, i.e. complete
+# at forecast time.
+LAGS = {"lag168": 168, "lag48": 48, "lag25": 25}
+FEATURES = ("lag168", "lag48", "lag25", "level24", "profile")
 
 
 # --------------------------------------------------------------------------- shared helpers
@@ -57,12 +61,14 @@ def slot_of(at: datetime.datetime) -> int:
     return int(slot_of_index(pd.DatetimeIndex([pd.Timestamp(at)]))[0])
 
 
-def forecast_value(coef: typing.Sequence[float], lag168, lag48, level24, profile: float) -> float:
-    """The one formula both training and inference use."""
-    lag168 = profile if lag168 is None else lag168
-    lag48 = profile if lag48 is None else lag48
-    level24 = profile if level24 is None else level24
-    return float(coef[0] + coef[1] * lag168 + coef[2] * lag48 + coef[3] * level24 + coef[4] * profile)
+def forecast_value(coef: typing.Sequence[float], features: typing.Dict[str, typing.Optional[float]],
+                   profile: float) -> float:
+    """The one formula both training and inference use. A missing feature takes the profile."""
+    total = float(coef[0])
+    for weight, name in zip(coef[1:], FEATURES):
+        value = profile if name == "profile" else features.get(name)
+        total += float(weight) * (profile if value is None else float(value))
+    return total
 
 
 # --------------------------------------------------------------------------- fitting
@@ -109,8 +115,8 @@ def fit_profile(y: pd.Series) -> np.ndarray:
 def feature_frame(y: pd.Series, profile: np.ndarray) -> pd.DataFrame:
     f = pd.DataFrame(index=y.index)
     f["profile"] = profile[slot_of_index(y.index)]
-    f["lag168"] = y.shift(168).fillna(f["profile"])
-    f["lag48"] = y.shift(48).fillna(f["profile"])
+    for name, hours in LAGS.items():
+        f[name] = y.shift(hours).fillna(f["profile"])
     f["level24"] = y.rolling(24, min_periods=12).mean().shift(25).fillna(f["profile"])
     f["y"] = y
     return f
@@ -147,8 +153,8 @@ def fit(y: pd.Series) -> typing.Tuple[dict, dict]:
         val = f_all[f_all.index >= split]
         actual = val["y"].values
         metrics["val_rmse"] = _rmse(predict_frame(coef_v, val), actual)
-        metrics["val_rmse_naive_lag168"] = _rmse(val["lag168"].values, actual)
-        metrics["val_rmse_naive_lag48"] = _rmse(val["lag48"].values, actual)
+        for name in LAGS:
+            metrics[f"val_rmse_naive_{name}"] = _rmse(val[name].values, actual)
         metrics["val_rmse_profile"] = _rmse(val["profile"].values, actual)
         metrics["val_hours"] = float(np.sum(~np.isnan(actual)))
 
@@ -163,6 +169,8 @@ def fit(y: pd.Series) -> typing.Tuple[dict, dict]:
     tail = y[y.index >= end - pd.Timedelta(hours=HISTORY_HOURS)].dropna()
     params = {
         "coef": [float(c) for c in coef],
+        "features": list(FEATURES),
+        "lags": dict(LAGS),
         "profile": [float(p) for p in profile],
         "history": {ts.isoformat(): float(v) for ts, v in tail.items()},
         "horizon_h": HORIZON_H,
@@ -188,8 +196,7 @@ class OdeAblationLoadL1Model(PythonModel):
     def predict(self, context, model_input=None, params=None):
         payload = model_input if model_input is not None else context
         if isinstance(payload, dict) and payload.get("op") == "forecast":
-            return forecast_value(self.params["coef"], payload.get("lag168"), payload.get("lag48"),
-                                  payload.get("level24"), float(payload["profile"]))
+            return forecast_value(self.params["coef"], payload, float(payload["profile"]))
         return self.params
 
 
